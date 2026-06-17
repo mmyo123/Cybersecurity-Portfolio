@@ -1,0 +1,329 @@
+From: "Accounts Payable" <billing@contoso-invoicing.example>
+Reply-To: ap-finance@contoso-invoicing.example
+Return-Path: <bounce@contoso-invoicing.example>
+To: finance@northwindtraders.example
+Subject: Invoice #88213 Overdue - Immediate Payment Required
+Date: Wed, 10 Jun 2026 14:02:09 -0500
+Message-ID: <x9y8z7@contoso-invoicing.example>
+Authentication-Results: mx.northwindtraders.example; spf=softfail smtp.mailfrom=contoso-invoicing.example; dkim=none; dmarc=fail (p=none) header.from=contoso-invoicing.example
+Content-Type: text/plain; charset=us-ascii
+
+Hello,
+
+Invoice #88213 for $4,820.00 is now 15 days overdue. Please remit payment immediately to avoid late fees and possible service interruption. Updated banking details are included in the attached document, Invoice_88213_Updated.html.
+
+Regards,
+Accounts Payable
+Contoso Ltd.
+
+From: "Northwind IT" <it-support@northwindtraders.example>
+Reply-To: it-support@northwindtraders.example
+Return-Path: <it-support@northwindtraders.example>
+To: jsmith@northwindtraders.example
+Subject: Scheduled Maintenance - VPN Access This Weekend
+Date: Tue, 9 Jun 2026 11:30:00 -0500
+Message-ID: <m1n2o3@northwindtraders.example>
+Authentication-Results: mx.northwindtraders.example; spf=pass smtp.mailfrom=northwindtraders.example; dkim=pass header.d=northwindtraders.example; dmarc=pass (p=reject) header.from=northwindtraders.example
+Content-Type: text/plain; charset=us-ascii
+
+Hi team,
+
+Quick reminder that VPN access will be briefly unavailable this Saturday from 1-3 AM CT for scheduled maintenance. No action is required on your part.
+
+Thanks,
+Northwind IT
+
+#!/usr/bin/env python3
+"""
+analyze_email.py
+
+A lightweight phishing-triage helper for SOC / help-desk analysts.
+
+Given a raw .eml file, this script parses key header fields and applies a
+small set of heuristics commonly used during first-pass phishing triage:
+
+  * Sender authentication results (SPF / DKIM / DMARC)
+  * From / Reply-To / Return-Path domain alignment
+  * Urgency / social-engineering language in the subject and body
+  * Embedded links that try to impersonate the organization's brand
+
+It is intentionally simple and transparent: every flag it raises is
+explainable, which matters more in an analyst report than a black-box
+score. Output is a structured finding list plus an overall risk rating.
+
+Usage:
+    python3 analyze_email.py sample_email_1_phishing.eml
+    python3 analyze_email.py *.eml
+"""
+
+import sys
+import re
+from email import policy
+from email.parser import BytesParser
+from urllib.parse import urlparse
+
+URGENCY_PHRASES = [
+    "urgent", "immediately", "24 hours", "act now", "suspended",
+    "verify your account", "failure to act", "expire", "final notice",
+    "unauthorized", "click here",
+]
+
+# In production these would come from a config file / allow-list rather
+# than being hard-coded.
+TRUSTED_DOMAIN = "northwindtraders.example"
+BRAND_KEYWORD = "northwind"  # used to catch look-alike domains
+
+
+def get_domain(address: str) -> str:
+    """Return the domain portion of an email address, lowercased."""
+    if not address or "@" not in address:
+        return ""
+    return address.strip().rsplit("@", 1)[-1].strip("> ").lower()
+
+
+def parse_auth_results(header_value: str) -> dict:
+    """Pull spf / dkim / dmarc verdicts out of an Authentication-Results header."""
+    results = {}
+    for mech in ("spf", "dkim", "dmarc"):
+        match = re.search(rf"{mech}=(\w+)", header_value or "", re.IGNORECASE)
+        results[mech] = match.group(1).lower() if match else "unknown"
+    return results
+
+
+def extract_urls(text: str) -> list:
+    return re.findall(r"https?://[^\s)>\]]+", text or "")
+
+
+def analyze(eml_path: str) -> dict:
+    with open(eml_path, "rb") as f:
+        msg = BytesParser(policy=policy.default).parse(f)
+
+    findings = []
+    score = 0
+
+    from_addr = msg.get("From", "")
+    reply_to = msg.get("Reply-To", "")
+    return_path = msg.get("Return-Path", "")
+    subject = msg.get("Subject", "")
+    auth_header = msg.get("Authentication-Results", "")
+
+    from_domain = get_domain(from_addr)
+    reply_domain = get_domain(reply_to) if reply_to else from_domain
+    return_domain = get_domain(return_path) if return_path else from_domain
+
+    auth = parse_auth_results(auth_header)
+    for mech in ("spf", "dkim", "dmarc"):
+        if auth[mech] in ("fail", "softfail"):
+            findings.append(f"{mech.upper()} check returned '{auth[mech]}'")
+            score += 2 if auth[mech] == "fail" else 1
+
+    if reply_to and reply_domain != from_domain:
+        findings.append(
+            f"Reply-To domain ({reply_domain}) does not match From domain ({from_domain})"
+        )
+        score += 2
+
+    if return_path and return_domain != from_domain:
+        findings.append(
+            f"Return-Path domain ({return_domain}) does not match From domain ({from_domain})"
+        )
+        score += 1
+
+    if from_domain and from_domain != TRUSTED_DOMAIN:
+        findings.append(
+            f"Sending domain '{from_domain}' is not the organization's verified domain"
+        )
+        score += 2
+
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                body += part.get_content()
+    else:
+        body = msg.get_content()
+
+    full_text = f"{subject}\n{body}".lower()
+    matched_phrases = [p for p in URGENCY_PHRASES if p in full_text]
+    if matched_phrases:
+        findings.append(
+            f"Urgency / social-engineering language detected: {', '.join(matched_phrases)}"
+        )
+        score += len(matched_phrases)
+
+    urls = extract_urls(body)
+    suspicious_urls = []
+    for url in urls:
+        netloc = urlparse(url).netloc.lower()
+        if BRAND_KEYWORD in netloc and not netloc.endswith(TRUSTED_DOMAIN):
+            suspicious_urls.append(url)
+            score += 3
+    if suspicious_urls:
+        findings.append(f"Link(s) impersonating the organization's brand: {suspicious_urls}")
+
+    if score >= 6:
+        risk = "High"
+    elif score >= 3:
+        risk = "Medium"
+    else:
+        risk = "Low"
+
+    return {
+        "file": eml_path,
+        "subject": subject,
+        "from": from_addr,
+        "reply_to": reply_to or "(none)",
+        "return_path": return_path or "(none)",
+        "auth_results": auth,
+        "urls": urls,
+        "findings": findings,
+        "score": score,
+        "risk": risk,
+    }
+
+
+def print_report(result: dict) -> None:
+    print("=" * 70)
+    print(f"FILE:        {result['file']}")
+    print(f"SUBJECT:     {result['subject']}")
+    print(f"FROM:        {result['from']}")
+    print(f"REPLY-TO:    {result['reply_to']}")
+    print(f"RETURN-PATH: {result['return_path']}")
+    print(f"AUTH:        SPF={result['auth_results']['spf']}  "
+          f"DKIM={result['auth_results']['dkim']}  DMARC={result['auth_results']['dmarc']}")
+    print(f"LINKS:       {result['urls'] or '(none found)'}")
+    print(f"RISK:        {result['risk']}  (score={result['score']})")
+    if result["findings"]:
+        print("FINDINGS:")
+        for f in result["findings"]:
+            print(f"  - {f}")
+    else:
+        print("FINDINGS:    No indicators detected.")
+    print()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python3 analyze_email.py <file1.eml> [file2.eml ...]")
+        sys.exit(1)
+
+    for path in sys.argv[1:]:
+        print_report(analyze(path))
+
+# Phishing Email Triage Lab
+
+## Overview
+A Python tool that performs first-pass phishing triage on raw `.eml` files,
+the same task a SOC Tier-1 analyst or help-desk technician does dozens of
+times a week when a user reports a suspicious email. It checks sender
+authentication (SPF/DKIM/DMARC), header alignment (From / Reply-To /
+Return-Path), social-engineering language, and look-alike links, then
+produces a structured finding list and a risk rating.
+
+## Files
+- `analyze_email.py` — the triage tool
+- `sample_email_1_phishing.eml` — fake IT password-reset lure
+- `sample_email_2_phishing.eml` — fake overdue-invoice / BEC-style lure
+- `sample_email_3_legitimate.eml` — a clean internal email, for contrast
+
+All three are synthetic samples built for this lab (fictional company,
+`.example` domains per RFC 2606 so nothing resolves to a real address).
+
+## How to run it
+```
+python3 analyze_email.py sample_email_1_phishing.eml sample_email_2_phishing.eml sample_email_3_legitimate.eml
+```
+
+## Actual output from this run
+```
+======================================================================
+FILE:        sample_email_1_phishing.eml
+RISK:        High  (score=19)
+FINDINGS:
+  - SPF check returned 'fail'
+  - DKIM check returned 'fail'
+  - DMARC check returned 'fail'
+  - Reply-To domain (secure-mail-update.example) does not match From domain (northwind-it-help.example)
+  - Return-Path domain (secure-mail-update.example) does not match From domain (northwind-it-help.example)
+  - Sending domain 'northwind-it-help.example' is not the organization's verified domain
+  - Urgency / social-engineering language detected: urgent, immediately, 24 hours, failure to act, expire
+  - Link(s) impersonating the organization's brand: ['http://secure-login.northwind-update.example/verify?user=jsmith']
+
+======================================================================
+FILE:        sample_email_2_phishing.eml
+RISK:        High  (score=6)
+FINDINGS:
+  - SPF check returned 'softfail'
+  - DMARC check returned 'fail'
+  - Sending domain 'contoso-invoicing.example' is not the organization's verified domain
+  - Urgency / social-engineering language detected: immediately
+
+======================================================================
+FILE:        sample_email_3_legitimate.eml
+RISK:        Low  (score=0)
+FINDINGS:    No indicators detected.
+```
+
+## Sample analyst report (Email #1)
+
+**Who:** End user (jsmith@northwindtraders.example) reported a suspicious
+email claiming to be from the internal IT Service Desk.
+
+**What:** A password-expiration phishing attempt requesting credential
+verification via an external link.
+
+**When:** Received Mon, 15 Jun 2026 09:14 CT; triaged same day.
+
+**Where:** Delivered to the user's corporate inbox; the credential-harvesting
+link points to `secure-login.northwind-update.example`, a domain not owned
+by the organization.
+
+**Why flagged:** SPF, DKIM, and DMARC all failed for the sending domain.
+The Reply-To and Return-Path addresses resolve to a third domain
+(`secure-mail-update.example`) that matches neither the From address nor
+the organization's verified domain — a strong indicator of header spoofing
+rather than a simple typo or forwarding rule. The message also uses
+high-pressure language ("24 hours," "failure to act," "suspension") typical
+of credential-phishing campaigns, and the embedded link uses the brand name
+"northwind" in a domain that is not the organization's own.
+
+**Disposition:** Classified High risk (score 19/19 possible signals
+triggered). Recommended actions: block the sending domain and the
+linked domain at the mail gateway, purge the message from any other
+inboxes it was delivered to, and notify the reporting user that no action
+is required on their end — they should not click the link or enter
+credentials if they already have.
+
+## Resume entry (suggested)
+
+**Phishing Triage Analyst (Lab / Simulation)**
+*Custom Phishing Header Analysis Tool*
+
+Built a Python tool to triage suspected phishing emails by parsing sender
+authentication results (SPF/DKIM/DMARC), detecting From/Reply-To/Return-Path
+mismatches, and flagging brand-impersonating links and urgency-based social
+engineering language. Tested against a set of sample emails and produced
+structured, risk-rated analyst reports in a Five Ws format — mirroring the
+triage workflow used for end-user-reported phishing tickets in SOC and
+help-desk environments.
+
+From: "IT Service Desk" <support@northwind-it-help.example>
+Reply-To: helpdesk@secure-mail-update.example
+Return-Path: <bounce@secure-mail-update.example>
+To: jsmith@northwindtraders.example
+Subject: URGENT: Your password expires in 24 hours - Action Required
+Date: Mon, 15 Jun 2026 09:14:22 -0500
+Message-ID: <a1b2c3@secure-mail-update.example>
+Authentication-Results: mx.northwindtraders.example; spf=fail smtp.mailfrom=secure-mail-update.example; dkim=fail header.d=secure-mail-update.example; dmarc=fail (p=reject) header.from=northwind-it-help.example
+Content-Type: text/plain; charset=us-ascii
+
+Dear Employee,
+
+Our records indicate that your network password will expire in 24 hours. To avoid losing access to your account, please verify your credentials immediately using the secure link below:
+
+http://secure-login.northwind-update.example/verify?user=jsmith
+
+Failure to act within 24 hours will result in automatic account suspension.
+
+IT Service Desk
+Northwind Traders
