@@ -1,0 +1,28 @@
+# ARP Spoofing Detection Lab
+
+## Overview
+
+This project demonstrates how ARP spoofing attacks can be detected through packet analysis. Using Scapy, I generated a synthetic packet capture containing normal network activity and a simulated ARP cache poisoning attack. A Python analysis tool then established baseline IP-to-MAC mappings and identified conflicting claims for the default gateway IP address.
+
+## Files
+
+* generate_traffic.py — Creates a synthetic network packet capture
+* analyze_traffic.py — Detects conflicting ARP mappings
+* lab_traffic.pcap — Packet capture for analysis
+
+## Skills Demonstrated
+
+* Python
+* Scapy
+* Packet Analysis
+* Network Security
+* ARP Spoofing Detection
+* Wireshark
+* Incident Investigation
+
+## Example Finding
+
+10.0.0.1 -> ['aa:bb:cc:00:00:01', 'de:ad:be:ef:00:13']
+
+This indicates two MAC addresses claiming ownership of the same gateway IP address, a common indicator of ARP spoofing or man-in-the-middle activity.
+
