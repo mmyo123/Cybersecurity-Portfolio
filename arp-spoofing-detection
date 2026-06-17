@@ -1,0 +1,189 @@
+# Network Traffic Analysis Lab — ARP Spoofing Detection
+
+## Overview
+A self-built packet capture and analysis exercise using Python (Scapy)
+instead of a packaged training platform. `generate_traffic.py` constructs
+a small, realistic capture (ARP, DNS, TCP) entirely offline and writes it
+to a `.pcap` file. `analyze_traffic.py` then reads that file and baselines
+IP-to-MAC mappings from ARP replies, flagging any IP that's claimed by more
+than one MAC address — the standard signature of ARP spoofing / cache
+poisoning (the same logic tools like arpwatch and Wireshark's duplicate-IP
+filter use).
+
+## Files
+- `generate_traffic.py` — builds the synthetic capture
+- `analyze_traffic.py` — reads it and runs the detection
+- `lab_traffic.pcap` — the generated capture (openable in real Wireshark)
+
+## How to run it
+```
+python3 generate_traffic.py
+python3 analyze_traffic.py
+```
+
+## Actual output from this run
+```
+Wrote 13 packets to lab_traffic.pcap
+============================================================
+Total packets analyzed: 13
+Protocol breakdown: {'ARP': 8, 'DNS': 2, 'TCP': 3}
+
+ARP reply table (IP -> MAC addresses claiming it):
+  10.0.0.1 -> ['aa:bb:cc:00:00:01', 'de:ad:be:ef:00:13']
+
+FINDING: Possible ARP spoofing / cache poisoning detected
+  IP 10.0.0.1 was claimed by 2 different MAC addresses: ['aa:bb:cc:00:00:01', 'de:ad:be:ef:00:13']
+  -> Matches the classic pattern of a rogue host trying to intercept
+     traffic destined for that IP (commonly the default gateway).
+```
+
+## Sample analyst report
+
+**Who:** Internal client host 10.0.0.25, monitoring traffic on its local
+segment.
+
+**What:** Detected unsolicited ARP replies claiming ownership of the
+default gateway's IP address (10.0.0.1) from a second, unrecognized MAC
+address (`de:ad:be:ef:00:13`), alongside the gateway's legitimate MAC
+(`aa:bb:cc:00:00:01`).
+
+**When:** Captured during a routine traffic baseline; six conflicting ARP
+replies observed in a 13-packet sample window.
+
+**Where:** Local network segment 10.0.0.0/24; affects any host on the
+segment that updates its ARP cache from unsolicited replies.
+
+**Why flagged:** A single IP address should resolve to exactly one MAC
+address on a healthy network. Two MACs claiming the same IP — especially
+the gateway, the highest-value target for traffic interception — is the
+defining signature of ARP spoofing, typically a precursor to an on-path
+(man-in-the-middle) attack used to intercept or redirect traffic before it
+reaches the real gateway.
+
+**Disposition:** Flagged High priority. Recommended actions: identify the
+physical port/switch associated with the rogue MAC, isolate the host,
+and consider deploying dynamic ARP inspection (DAI) or static ARP entries
+for critical infrastructure IPs to prevent recurrence.
+
+#!/usr/bin/env python3
+"""
+generate_traffic.py
+
+Builds a small synthetic network capture for practicing traffic analysis.
+Nothing here touches a real network interface -- packets are only built
+in memory and written to a .pcap file. All addressing is private
+(RFC 1918) / locally-administered, so it's safe to inspect and re-run.
+
+The capture contains:
+  1. Normal ARP request/reply traffic (a client learning the gateway's MAC)
+  2. A normal DNS query/response for an internal hostname
+  3. A normal TCP three-way handshake (client -> internal web server)
+  4. An injected anomaly: a rogue host sending unsolicited ARP replies
+     claiming to own the gateway's IP -- the classic setup for an
+     ARP-spoofing / on-path (MITM) attack
+"""
+
+from scapy.all import Ether, ARP, IP, UDP, TCP, DNS, DNSQR, DNSRR, wrpcap
+
+packets = []
+
+CLIENT_IP, CLIENT_MAC = "10.0.0.25", "aa:bb:cc:00:00:19"
+GATEWAY_IP, GATEWAY_MAC = "10.0.0.1", "aa:bb:cc:00:00:01"
+SERVER_IP, SERVER_MAC = "10.0.0.50", "aa:bb:cc:00:00:32"
+ROGUE_MAC = "de:ad:be:ef:00:13"
+
+# 1. Normal ARP: client asks "who has the gateway?", gateway answers truthfully
+packets.append(Ether(src=CLIENT_MAC, dst="ff:ff:ff:ff:ff:ff") /
+               ARP(op=1, psrc=CLIENT_IP, pdst=GATEWAY_IP, hwsrc=CLIENT_MAC))
+packets.append(Ether(src=GATEWAY_MAC, dst=CLIENT_MAC) /
+               ARP(op=2, psrc=GATEWAY_IP, hwsrc=GATEWAY_MAC, pdst=CLIENT_IP, hwdst=CLIENT_MAC))
+
+# 2. Normal DNS query/response for an internal hostname
+packets.append(Ether(src=CLIENT_MAC, dst=GATEWAY_MAC) /
+               IP(src=CLIENT_IP, dst=SERVER_IP) /
+               UDP(sport=51010, dport=53) /
+               DNS(rd=1, qd=DNSQR(qname="intranet.northwind.local")))
+packets.append(Ether(src=SERVER_MAC, dst=GATEWAY_MAC) /
+               IP(src=SERVER_IP, dst=CLIENT_IP) /
+               UDP(sport=53, dport=51010) /
+               DNS(qr=1, qd=DNSQR(qname="intranet.northwind.local"),
+                   an=DNSRR(rrname="intranet.northwind.local", rdata=SERVER_IP)))
+
+# 3. Normal TCP handshake to the internal web server
+packets.append(Ether(src=CLIENT_MAC, dst=GATEWAY_MAC) /
+               IP(src=CLIENT_IP, dst=SERVER_IP) /
+               TCP(sport=44321, dport=80, flags="S", seq=1000))
+packets.append(Ether(src=SERVER_MAC, dst=GATEWAY_MAC) /
+               IP(src=SERVER_IP, dst=CLIENT_IP) /
+               TCP(sport=80, dport=44321, flags="SA", seq=5000, ack=1001))
+packets.append(Ether(src=CLIENT_MAC, dst=GATEWAY_MAC) /
+               IP(src=CLIENT_IP, dst=SERVER_IP) /
+               TCP(sport=44321, dport=80, flags="A", seq=1001, ack=5001))
+
+# 4. Injected anomaly: a rogue host floods unsolicited ARP replies claiming
+#    to be the gateway. Real ARP spoofing tools (e.g. arpspoof) work exactly
+#    this way -- this just recreates the network-level signature offline.
+for _ in range(6):
+    packets.append(Ether(src=ROGUE_MAC, dst="ff:ff:ff:ff:ff:ff") /
+                   ARP(op=2, psrc=GATEWAY_IP, hwsrc=ROGUE_MAC,
+                       pdst=CLIENT_IP, hwdst=CLIENT_MAC))
+
+wrpcap("lab_traffic.pcap", packets)
+print(f"Wrote {len(packets)} packets to lab_traffic.pcap")
+
+
+
+#!/usr/bin/env python3
+"""
+analyze_traffic.py
+
+Reads lab_traffic.pcap and looks for IP addresses claimed by more than one
+MAC address in ARP replies -- the standard signature of ARP spoofing /
+cache poisoning. This is the same baseline-and-compare technique tools
+like arpwatch, and Wireshark's "Duplicate IP address configured" filter,
+rely on.
+"""
+
+from collections import defaultdict
+from scapy.all import rdpcap, ARP, IP, TCP, DNS
+
+packets = rdpcap("lab_traffic.pcap")
+
+ip_to_macs = defaultdict(set)
+protocol_counts = defaultdict(int)
+
+for pkt in packets:
+    if pkt.haslayer(ARP):
+        protocol_counts["ARP"] += 1
+        arp = pkt[ARP]
+        if arp.op == 2:  # "is-at" (reply)
+            ip_to_macs[arp.psrc].add(arp.hwsrc)
+    if pkt.haslayer(DNS) and pkt.haslayer(IP):
+        protocol_counts["DNS"] += 1
+    elif pkt.haslayer(TCP):
+        protocol_counts["TCP"] += 1
+
+print("=" * 60)
+print(f"Total packets analyzed: {len(packets)}")
+print(f"Protocol breakdown: {dict(protocol_counts)}")
+print()
+
+print("ARP reply table (IP -> MAC addresses claiming it):")
+findings = []
+for ip, macs in ip_to_macs.items():
+    print(f"  {ip} -> {sorted(macs)}")
+    if len(macs) > 1:
+        findings.append((ip, macs))
+
+print()
+if findings:
+    print("FINDING: Possible ARP spoofing / cache poisoning detected")
+    for ip, macs in findings:
+        print(f"  IP {ip} was claimed by {len(macs)} different MAC addresses: {sorted(macs)}")
+        print("  -> Matches the classic pattern of a rogue host trying to intercept")
+        print("     traffic destined for that IP (commonly the default gateway).")
+else:
+    print("No conflicting ARP mappings found.")
+
+
+
